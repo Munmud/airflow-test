@@ -1,51 +1,117 @@
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from datetime import datetime, timedelta
-from pipeline import (ingest_data, preprocess_data, train_model,
-                     evaluate_model, deploy_model)
+from airflow.providers.http.hooks.http import HttpHook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.operators.python import PythonOperator
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+import requests
+import json
 
-default_args = {
-    'owner': 'your_name',
-    'start_date': datetime(2024, 10, 20),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+#Latitude and longitude for the desired location (London in this case)
+LATITUDE= '51.5074'
+LONGITUDE= '-0.1278'
+POSTGRES_CONN_ID= 'postgres_default'
+API_CONN_ID= 'open_meteo_api'
+
+default_args= {
+    'owner': 'airflow',
+    'start_date': days_ago(1)
 }
 
-dag = DAG(
-    'ml_pipeline',
-    default_args=default_args,
-    description='ML pipeline using Airflow',
-    schedule_interval=timedelta(days=1),
-)
+def extract_weatherdata():
+        """Extract weather data from Open meteo api using airflow connection"""
 
-t1 = PythonOperator(
-    task_id='ingest_data',
-    python_callable=ingest_data,
-    dag=dag,
-)
+        #Use http hook to get connection details from airflow connection
+        http_hook= HttpHook(http_conn_id=API_CONN_ID, method='GET')
 
-t2 = PythonOperator(
-    task_id='preprocess_data',
-    python_callable=preprocess_data,
-    dag=dag,
-)
+        ##Build api endpoint
+        ## https://api.open-meteo.com/v1/forecast?latitude=51.5074&longitude=-0.1278&current_weather=true
+        endpoint= f'/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}&current_weather=true'
 
-t3 = PythonOperator(
-    task_id='train_model',
-    python_callable=train_model,
-    dag=dag,
-)
+        #Make the request via httphook
+        response= http_hook.run(endpoint)
 
-t4 = PythonOperator(
-    task_id='evaluate_model',
-    python_callable=evaluate_model,
-    dag=dag,
-)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise Exception(f"Failed to fetch data: {response.status_code}")
+        
 
-t5 = PythonOperator(
-    task_id='deploy_model',
-    python_callable=deploy_model,
-    dag=dag,
-)
+    
+def transform_weatherdata(weather_data):
+        """Transform the extracted weather data"""
+        current_weather= weather_data['current_weather']
+        transformed_data={
+            'latitude' : float(LATITUDE),
+            'longitude': float(LONGITUDE),
+            "temperature": current_weather['temperature'],
+            'windspeed': current_weather['windspeed'],
+            'winddirection': current_weather['winddirection'],
+            'weathercode': current_weather['weathercode'],
 
-t1 >> t2 >> t3 >> t4 >> t5
+        }
+        return transformed_data
+    
+    
+def load_weatherdata(transformed_data):
+        """Load transformed data to postgres"""
+        pg_hook= PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        conn= pg_hook.get_conn()
+        cursor= conn.cursor()
+
+        #create table if it doesn't exist
+        cursor.execute(
+            """create table if not exist weather_data(
+            latitude FLOAT
+            longitude FLOAT
+            temperature INT
+            windspeed INT
+            winddirection INT
+            weathercode INT
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );"""
+        )
+
+        #Insert transformed data into the table
+        cursor.execute(
+            """INSERT INTO weather_data (latitude, longitude, temperature, windspeed, winddirection, weathercode)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                transformed_data['latitude'],
+                transformed_data['longitude'],
+                transformed_data['temperature'],
+                transformed_data['windspeed'],
+                transformed_data['winddirection'],
+                transformed_data['weathercode'],
+            )
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+with DAG(dag_id='etl_weather_pipeline',
+         default_args=default_args,
+         schedule_interval='@daily',
+         catchup=False
+         ) as dag:
+        
+        extract_task= PythonOperator(
+               task_id='extract_weather',
+               python_callable=extract_weatherdata
+        )
+
+        transform_task= PythonOperator(
+               task_id='transform_weatherdata',
+               python_callable=transform_weatherdata,
+               op_args=[extract_task.output]
+        )
+
+        load_task= PythonOperator(
+               task_id='load_weatherdata',
+               python_callable=load_weatherdata,
+               op_args=[transform_task.output]
+        )
+        
+        #DAG workflow
+        
+        extract_task >> transform_task >> load_task
