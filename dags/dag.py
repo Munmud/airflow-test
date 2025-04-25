@@ -15,7 +15,7 @@ dag = DAG(
     'ml_pipeline',
     default_args=default_args,
     description='ML pipeline using Airflow',
-    schedule_interval=timedelta(days=1),
+    schedule_interval="@once", # Run once
 )
 
 t1 = PythonOperator(
